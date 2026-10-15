@@ -1,0 +1,5 @@
+fault_scenario,uncheckpointed_records,recovered_records,truncated_tail_bytes,recovery_time_ms,data_integrity_verified
+CleanShutdownAfterCheckpoint,0,0,0,0.046,PASS
+UnflushedBufferPoolCrash_200Ops,200,200,0,0.247,PASS
+UnflushedBufferPoolCrash_1000Ops,1000,1000,0,1.245,PASS
+TornWALTailWriteCrash_500Ops_13Bytes,500,500,13,0.645,PASS

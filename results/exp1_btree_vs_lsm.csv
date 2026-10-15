@@ -1,0 +1,9 @@
+engine,workload,operations,elapsed_ms,ops_per_sec,waf,raf,disk_bytes
+BPlusTree,RandomWrite,3000,70.16,42761.66,11.26,0.00,675840
+BPlusTree,RandomPointRead,3000,60.79,49347.39,11.26,0.61,675840
+BPlusTree,MissingKeyLookup,3000,0.33,9047262.90,11.26,0.00,675840
+BPlusTree,RangeScan50Keys,200,5.15,38816.48,11.26,0.66,675840
+LSMTree,RandomWrite,3000,30.24,99194.88,4.12,0.00,462848
+LSMTree,RandomPointRead,3000,119.68,25066.53,4.12,1.01,462848
+LSMTree,MissingKeyLookup,3000,0.13,23754285.67,4.12,0.00,462848
+LSMTree,RangeScan50Keys,200,49.11,4072.90,4.12,5.72,462848
