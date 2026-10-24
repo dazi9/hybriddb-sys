@@ -135,6 +135,18 @@ public:
     // Simulates an abrupt power-loss crash by discarding all un-flushed dirty frames in RAM
     void simulate_crash_discard_dirty_frames();
 
+    // Steal policy: when allowed (default), evicting a dirty victim writes it
+    // back individually. When disallowed (no-steal, used by the WAL-based
+    // B+Tree engine), dirty victims are never written outside a checkpoint:
+    // the caller must run a checkpoint when eviction reports exhaustion, so
+    // on-disk pages only ever change at checkpoint boundaries and crash
+    // recovery can replay the WAL onto a consistent image.
+    void set_allow_steal(bool allow) noexcept { allow_steal_ = allow; }
+    [[nodiscard]] bool allow_steal() const noexcept { return allow_steal_; }
+
+    // Number of frames currently holding un-flushed dirty pages.
+    size_t dirty_frame_count();
+
     [[nodiscard]] size_t pool_size() const noexcept { return pool_size_; }
 
 private:
@@ -155,6 +167,7 @@ private:
     std::vector<frame_id_t> free_list_;
     std::unordered_map<page_id_t, frame_id_t> page_table_;
     mutable std::mutex latch_;
+    bool allow_steal_{true};
 };
 
 }  // namespace hybriddb

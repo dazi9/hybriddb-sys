@@ -4,6 +4,9 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace hybriddb {
 
@@ -137,7 +140,12 @@ LSMTreeEngine::LSMTreeEngine(const LSMConfig& config)
         config_.db_dir / "lsm.wal",
         config_.sync_wal_on_write,
         &stats_);
-    initialize_or_recover();
+    // Fail closed: a corrupt MANIFEST or WAL must refuse the open rather
+    // than silently starting with partial level state (stale reads).
+    Status init_st = initialize_or_recover();
+    if (!init_st.ok()) {
+        throw std::runtime_error("LSMTreeEngine init failed: " + init_st.message);
+    }
 }
 
 LSMTreeEngine::~LSMTreeEngine() {
@@ -150,7 +158,10 @@ LSMTreeEngine::~LSMTreeEngine() {
 }
 
 Status LSMTreeEngine::initialize_or_recover() {
-    load_manifest();
+    // A corrupt MANIFEST must abort recovery instead of silently shrinking
+    // the live SSTable set (which surfaces stale values on later reads).
+    Status mst = load_manifest();
+    if (!mst.ok()) return mst;
 
     std::vector<WALRecord> records;
     Status wst = wal_->recover(&records, true);
@@ -605,29 +616,83 @@ void LSMTreeEngine::simulate_crash_without_flush() {
 
 Status LSMTreeEngine::save_manifest() {
     std::filesystem::path mpath = config_.db_dir / "MANIFEST";
-    std::ofstream out(mpath, std::ios::trunc);
-    if (!out.is_open()) return Status::IOError("Failed to open MANIFEST for write");
-    out << next_sst_id_ << "\n";
+    std::filesystem::path tmp_path = config_.db_dir / "MANIFEST.tmp";
+
+    std::ostringstream body;
+    body << next_sst_id_ << "\n";
     for (size_t lvl = 0; lvl < levels_.size(); ++lvl) {
         for (const auto& sst : levels_[lvl]) {
-            out << lvl << " " << sst.sst_id << " " << sst.file_path.filename().string() << "\n";
+            body << lvl << " " << sst.sst_id << " " << sst.file_path.filename().string() << "\n";
         }
     }
-    out.flush();
+    const std::string body_str = body.str();
+    const uint32_t crc = crc32_ieee(body_str.data(), body_str.size());
+
+    // Atomic manifest publication: write + fsync a temp file, then rename.
+    // Without the rename, a crash mid-write leaves a torn MANIFEST that
+    // silently drops live SSTables on the next open.
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return Status::IOError("Failed to open MANIFEST.tmp for write");
+    const std::string payload = "MANIFEST1 " + std::to_string(crc) + "\n" + body_str;
+    size_t off = 0;
+    while (off < payload.size()) {
+        ssize_t w = ::pwrite(fd, payload.data() + off, payload.size() - off,
+                             static_cast<off_t>(off));
+        if (w <= 0) {
+            ::close(fd);
+            return Status::IOError("MANIFEST.tmp write failed");
+        }
+        off += static_cast<size_t>(w);
+    }
+    ::fsync(fd);
+    ::close(fd);
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, mpath, ec);
+    if (ec) return Status::IOError("MANIFEST rename failed: " + ec.message());
+
+    // Persist the rename itself.
+    int dir_fd = ::open(config_.db_dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
+    }
     return Status::Ok();
 }
 
 Status LSMTreeEngine::load_manifest() {
     std::filesystem::path mpath = config_.db_dir / "MANIFEST";
     if (!std::filesystem::exists(mpath)) return Status::Ok();
-    std::ifstream in(mpath);
+    std::ifstream in(mpath, std::ios::binary);
     if (!in.is_open()) return Status::IOError("Failed to open MANIFEST");
 
-    in >> next_sst_id_;
+    // The manifest is the source of truth for which SSTables are live; a
+    // corrupted one must fail the open rather than silently shrink the level
+    // state (which surfaces stale values for keys living in dropped SSTs).
+    const std::string content((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+    constexpr const char* kMagic = "MANIFEST1 ";
+    constexpr size_t kMagicLen = 10;
+    if (content.size() < kMagicLen || content.compare(0, kMagicLen, kMagic) != 0) {
+        return Status::Corruption("MANIFEST: missing checksum header");
+    }
+    const size_t first_nl = content.find('\n', kMagicLen);
+    if (first_nl == std::string::npos) {
+        return Status::Corruption("MANIFEST: truncated header");
+    }
+    const uint32_t stored_crc = static_cast<uint32_t>(
+        std::stoul(content.substr(kMagicLen, first_nl - kMagicLen)));
+    const std::string body = content.substr(first_nl + 1);
+    if (crc32_ieee(body.data(), body.size()) != stored_crc) {
+        return Status::Corruption("MANIFEST: checksum mismatch");
+    }
+
+    std::istringstream body_in(body);
+    body_in >> next_sst_id_;
     uint32_t lvl = 0;
     uint64_t sid = 0;
     std::string fname;
-    while (in >> lvl >> sid >> fname) {
+    while (body_in >> lvl >> sid >> fname) {
         if (lvl >= levels_.size()) continue;
         std::filesystem::path spath = config_.db_dir / fname;
         if (!std::filesystem::exists(spath)) continue;

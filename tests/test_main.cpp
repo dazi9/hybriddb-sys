@@ -1,5 +1,6 @@
 #include <cassert>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -260,6 +261,163 @@ void test_bplustree_splits_scans_and_crash_recovery() {
     }
 }
 
+void test_wal_lsn_continuity_across_sessions() {
+    // Regression: a fresh WALManager restarts its lsn counter at 1 while the
+    // meta page persists a large checkpoint_lsn_ from the previous session;
+    // recovery then skipped every record written after that checkpoint.
+    // Session B's writes (post-checkpoint, crash-terminated) must survive.
+    auto dir = make_temp_dir("wal_lsn_continuity");
+    BPlusTreeConfig cfg{};
+    cfg.db_dir = dir;
+    cfg.buffer_pool_frames = 32;
+
+    {
+        // Session A: writes + clean checkpoint + clean close.
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 100; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            assert(btree.put(key_buf, "session_a").ok());
+        }
+        assert(btree.checkpoint().ok());
+    }
+
+    {
+        // Session B: fresh WALManager instance; more writes; hard crash
+        // without flush (destructor must skip the final checkpoint).
+        BPlusTreeEngine btree(cfg);
+        for (int i = 100; i < 150; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            assert(btree.put(key_buf, "session_b").ok());
+        }
+        btree.simulate_crash_without_flush();
+    }
+
+    {
+        // Session C: recovery must replay session B's WAL records even though
+        // their lsns are numerically small relative to session A's watermark.
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 150; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            std::string val;
+            Status st = btree.get(key_buf, &val);
+            assert(st.ok());
+            assert(val == (i < 100 ? "session_a" : "session_b"));
+        }
+    }
+}
+
+void test_btree_crash_before_first_checkpoint() {
+    // Regression: with no checkpoint ever run, the on-disk tree was just the
+    // blank creation skeleton; recovery used to navigate garbage and lose
+    // every write. WAL replay must rebuild from an empty root instead.
+    auto dir = make_temp_dir("btree_crash_no_ckpt");
+    BPlusTreeConfig cfg{};
+    cfg.db_dir = dir;
+    cfg.buffer_pool_frames = 32;
+    {
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 80; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            assert(btree.put(key_buf, "pre_ckpt_val").ok());
+        }
+        btree.simulate_crash_without_flush();
+    }
+    {
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 80; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            std::string val;
+            assert(btree.get(key_buf, &val).ok());
+            assert(val == "pre_ckpt_val");
+        }
+    }
+}
+
+void test_btree_dirty_pressure_small_pool() {
+    // Regression: dirty pages must never be written outside a checkpoint
+    // (no-steal policy). A tiny pool forces pressure checkpoints mid-session;
+    // a crash afterwards must still recover via the WAL.
+    auto dir = make_temp_dir("btree_pressure");
+    BPlusTreeConfig cfg{};
+    cfg.db_dir = dir;
+    cfg.buffer_pool_frames = 6;
+    {
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 150; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            assert(btree.put(key_buf, "payload_" + std::to_string(i)).ok());
+        }
+        for (int i = 0; i < 150; i += 7) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            assert(btree.del(key_buf).ok());
+        }
+        btree.simulate_crash_without_flush();
+    }
+    {
+        BPlusTreeEngine btree(cfg);
+        for (int i = 0; i < 150; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "user:%05d", i);
+            std::string val;
+            Status st = btree.get(key_buf, &val);
+            if (i % 7 == 0) {
+                assert(st.is_not_found());
+            } else {
+                assert(st.ok());
+            }
+        }
+    }
+}
+
+void test_lsm_manifest_corruption_fails_closed() {
+    // Regression: the MANIFEST is the source of truth for live SSTables.
+    // A corrupted manifest used to load silently, dropping SSTs and serving
+    // stale values; now the checksum must abort the open.
+    auto dir = make_temp_dir("lsm_manifest_corrupt");
+    LSMConfig cfg{};
+    cfg.db_dir = dir;
+    cfg.memtable_max_bytes = 8 * 1024;
+    {
+        LSMTreeEngine lsm(cfg);
+        for (int i = 0; i < 100; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "k:%05d", i);
+            assert(lsm.put(key_buf, "v" + std::to_string(i)).ok());
+        }
+        assert(lsm.compact_all().ok());
+    }
+
+    auto mpath = dir / "MANIFEST";
+    {
+        std::fstream f(mpath, std::ios::binary | std::ios::in | std::ios::out);
+        assert(f.is_open());
+        f.seekp(0, std::ios::end);
+        auto size = f.tellp();
+        f.seekp(size / 2);
+        char byte;
+        f.read(&byte, 1);
+        f.seekp(size / 2);
+        byte ^= 0x40;
+        f.write(&byte, 1);
+    }
+
+    bool threw = false;
+    try {
+        LSMTreeEngine lsm2(cfg);
+        (void)lsm2;
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
 void test_lsm_compaction_monkey_and_crash_recovery() {
     auto dir = make_temp_dir("lsm_engine");
     LSMConfig cfg{};
@@ -374,6 +532,10 @@ int main() {
     RUN_TEST(test_wal_recovery_and_fault_injection);
     RUN_TEST(test_bloom_filter_and_monkey_allocation);
     RUN_TEST(test_bplustree_splits_scans_and_crash_recovery);
+    RUN_TEST(test_wal_lsn_continuity_across_sessions);
+    RUN_TEST(test_btree_crash_before_first_checkpoint);
+    RUN_TEST(test_btree_dirty_pressure_small_pool);
+    RUN_TEST(test_lsm_manifest_corruption_fails_closed);
     RUN_TEST(test_lsm_compaction_monkey_and_crash_recovery);
     RUN_TEST(test_concurrent_multithreaded_engines);
 

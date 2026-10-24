@@ -60,8 +60,14 @@ public:
 
 private:
     Status initialize_or_recover();
-    Status write_meta_page();
+    Status write_meta_page(bool persist_immediately = false);
     Status read_meta_page();
+
+    // Checkpoint variants: `_locked` assumes the caller already holds
+    // rw_latch_ exclusively (used on the write path under dirty-frame
+    // pressure); the public checkpoint() takes the lock itself.
+    Status checkpoint_locked();
+    void maybe_checkpoint_for_pressure_locked();
 
     Status apply_put_internal(std::string_view key, std::string_view value, lsn_t lsn);
     Status apply_del_internal(std::string_view key, lsn_t lsn);

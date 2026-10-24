@@ -29,7 +29,11 @@ DiskManager::~DiskManager() {
 void DiskManager::close() {
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (fd_ >= 0) {
-        ::fsync(fd_);
+        // Only handles that wrote anything need an fsync on close; SST
+        // lookups open a fresh handle per search and must not pay for it.
+        if (has_written_) {
+            ::fsync(fd_);
+        }
         ::close(fd_);
         fd_ = -1;
     }
@@ -91,6 +95,7 @@ Status DiskManager::write_page(page_id_t page_id, SlottedPage* page) {
     if (page_id >= num_pages_) {
         num_pages_ = page_id + 1;
     }
+    has_written_ = true;
     if (stats_ != nullptr) {
         stats_->physical_page_writes++;
         stats_->physical_bytes_written += PAGE_SIZE;
@@ -107,6 +112,7 @@ page_id_t DiskManager::allocate_page() {
     off_t offset = static_cast<off_t>(pid) * static_cast<off_t>(PAGE_SIZE);
     ssize_t w = ::pwrite(fd_, blank.raw_data(), PAGE_SIZE, offset);
     (void)w;
+    has_written_ = true;
     if (stats_ != nullptr) {
         stats_->physical_page_writes++;
         stats_->physical_bytes_written += PAGE_SIZE;

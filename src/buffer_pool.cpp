@@ -259,6 +259,15 @@ bool BufferPoolManager::find_victim_frame(frame_id_t* out_frame) {
         return false;
     }
     FrameMeta& m = meta_[victim_fid];
+    if (m.is_dirty && !allow_steal_) {
+        // No-steal policy: never write a dirty page outside a checkpoint.
+        // Hand the frame back to the replacer and report exhaustion so the
+        // caller can checkpoint (flushing everything at a consistent
+        // watermark) and retry.
+        replacer_->record_access(victim_fid, m.page_id);
+        replacer_->set_evictable(victim_fid, true);
+        return false;
+    }
     if (m.is_dirty && m.page_id != INVALID_PAGE_ID) {
         disk_->write_page(m.page_id, &pages_[victim_fid]);
         m.is_dirty = false;
@@ -270,6 +279,15 @@ bool BufferPoolManager::find_victim_frame(frame_id_t* out_frame) {
     m.pin_count = 0;
     *out_frame = victim_fid;
     return true;
+}
+
+size_t BufferPoolManager::dirty_frame_count() {
+    std::lock_guard<std::mutex> lock(latch_);
+    size_t n = 0;
+    for (const auto& m : meta_) {
+        if (m.is_dirty) ++n;
+    }
+    return n;
 }
 
 SlottedPage* BufferPoolManager::fetch_page(page_id_t page_id, bool verify_crc) {

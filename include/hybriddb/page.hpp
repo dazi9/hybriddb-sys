@@ -248,6 +248,8 @@ private:
     uint32_t num_pages_{0};
     StorageStats* stats_{nullptr};
     mutable std::mutex io_mutex_;
+    // Read-only handles (e.g. SST lookups) must not pay an fsync on close.
+    bool has_written_{false};
 };
 
 }  // namespace hybriddb

@@ -1,6 +1,7 @@
 #include "hybriddb/btree.hpp"
 
 #include <cstring>
+#include <stdexcept>
 
 namespace hybriddb {
 
@@ -28,12 +29,26 @@ BPlusTreeEngine::BPlusTreeEngine(const BPlusTreeConfig& config)
         config_.db_dir / "btree.wal",
         config_.sync_wal_on_write,
         &stats_);
-    initialize_or_recover();
+    // No-steal buffer pool: dirty pages are never written to disk outside a
+    // checkpoint, so crash recovery can replay the WAL onto a consistent
+    // checkpoint image (see checkpoint_locked / find_victim_frame).
+    bpm_->set_allow_steal(false);
+    // Fail closed: corrupt meta page / WAL must refuse the open.
+    Status init_st = initialize_or_recover();
+    if (!init_st.ok()) {
+        throw std::runtime_error("BPlusTreeEngine init failed: " + init_st.message);
+    }
 }
 
 BPlusTreeEngine::~BPlusTreeEngine() {
     if (!crashed_simulation_) {
-        checkpoint();
+        // A failed final checkpoint silently loses every write since the
+        // last one; surface it instead of discarding the status.
+        Status st = checkpoint();
+        if (!st.ok()) {
+            std::fprintf(stderr, "[hybriddb] DTOR-CHECKPOINT-FAILED: %s\n",
+                         st.message.c_str());
+        }
     }
 }
 
@@ -51,7 +66,7 @@ std::string BPlusTreeEngine::encode_child_pid(page_id_t pid) {
     return s;
 }
 
-Status BPlusTreeEngine::write_meta_page() {
+Status BPlusTreeEngine::write_meta_page(bool persist_immediately) {
     SlottedPage* meta = bpm_->fetch_page(0, false);
     if (meta == nullptr) return Status::BufferExhausted();
     meta->reset(0, PageType::META_PAGE, checkpoint_lsn_);
@@ -63,7 +78,14 @@ Status BPlusTreeEngine::write_meta_page() {
     std::string_view val_sv(reinterpret_cast<const char*>(&payload), sizeof(payload));
     meta->upsert_sorted("META", val_sv);
     bpm_->unpin_page(0, true);
-    return bpm_->flush_page(0);
+    // Persisting the meta page alone must only happen when the tree image it
+    // describes is already fully on disk (fresh creation or checkpoint);
+    // otherwise a crash would leave the meta pointing at pages that were
+    // never written.
+    if (persist_immediately) {
+        return bpm_->flush_page(0);
+    }
+    return Status::Ok();
 }
 
 Status BPlusTreeEngine::read_meta_page() {
@@ -101,10 +123,29 @@ Status BPlusTreeEngine::initialize_or_recover() {
         root_page_id_ = root_pid;
         tree_height_ = 1;
         checkpoint_lsn_ = 0;
-        write_meta_page();
+        write_meta_page(true);
     } else {
         Status st = read_meta_page();
         if (!st.ok()) return st;
+    }
+
+    // The lsn counter must continue ABOVE the persisted checkpoint watermark.
+    // A fresh WALManager would otherwise restart at lsn 1 while meta still
+    // carries a large checkpoint_lsn_, and recovery would silently skip every
+    // record written by this session.
+    wal_->set_next_lsn(checkpoint_lsn_ + 1);
+
+    // Never checkpointed: on-disk tree pages are just the blank creation
+    // skeleton (allocate_page writes FREE-typed blank pages). Rebuild from an
+    // empty root and replay the whole WAL below.
+    if (checkpoint_lsn_ == 0 && disk_->num_pages() > 0) {
+        SlottedPage* root = bpm_->fetch_page(root_page_id_, false);
+        if (root != nullptr) {
+            root->reset(root_page_id_, PageType::BTREE_LEAF, 0);
+            root->seal_checksum();
+            bpm_->unpin_page(root_page_id_, true);
+        }
+        tree_height_ = 1;
     }
 
     // Replay WAL records with lsn > checkpoint_lsn_
@@ -330,11 +371,20 @@ Status BPlusTreeEngine::put(std::string_view key, std::string_view value) {
         return Status::InvalidArgument("Key or value size out of B+ Tree page bounds");
     }
     std::unique_lock<std::shared_mutex> lock(rw_latch_);
+    maybe_checkpoint_for_pressure_locked();
     lsn_t lsn = 0;
     Status wst = wal_->append(WALOpType::PUT, key, value, &lsn);
     if (!wst.ok()) return wst;
     stats_.logical_bytes_written += key.size() + value.size();
-    return apply_put_internal(key, value, lsn);
+    Status st = apply_put_internal(key, value, lsn);
+    if (st.code == StatusCode::BUFFER_POOL_EXHAUSTED) {
+        // No clean victim frame available (no-steal policy): checkpoint at a
+        // consistent watermark, then retry the operation once.
+        Status cst = checkpoint_locked();
+        if (!cst.ok()) return cst;
+        st = apply_put_internal(key, value, lsn);
+    }
+    return st;
 }
 
 Status BPlusTreeEngine::get(std::string_view key, std::string* out_value) {
@@ -361,11 +411,18 @@ Status BPlusTreeEngine::get(std::string_view key, std::string* out_value) {
 Status BPlusTreeEngine::del(std::string_view key) {
     if (key.empty()) return Status::InvalidArgument("Empty key");
     std::unique_lock<std::shared_mutex> lock(rw_latch_);
+    maybe_checkpoint_for_pressure_locked();
     lsn_t lsn = 0;
     Status wst = wal_->append(WALOpType::DEL, key, "", &lsn);
     if (!wst.ok()) return wst;
     stats_.logical_bytes_written += key.size();
-    return apply_del_internal(key, lsn);
+    Status st = apply_del_internal(key, lsn);
+    if (st.code == StatusCode::BUFFER_POOL_EXHAUSTED) {
+        Status cst = checkpoint_locked();
+        if (!cst.ok()) return cst;
+        st = apply_del_internal(key, lsn);
+    }
+    return st;
 }
 
 Status BPlusTreeEngine::scan(
@@ -411,11 +468,25 @@ Status BPlusTreeEngine::scan(
 
 Status BPlusTreeEngine::checkpoint() {
     std::unique_lock<std::shared_mutex> lock(rw_latch_);
+    return checkpoint_locked();
+}
+
+Status BPlusTreeEngine::checkpoint_locked() {
     Status st = bpm_->flush_all_pages();
     if (!st.ok()) return st;
     checkpoint_lsn_ = wal_->next_lsn() - 1;
-    write_meta_page();
+    write_meta_page(true);
     return wal_->truncate_and_reset();
+}
+
+void BPlusTreeEngine::maybe_checkpoint_for_pressure_locked() {
+    // Reserve headroom for one operation (leaf + new sibling + parent chain);
+    // if dirty frames approach capacity, checkpoint now so that eviction
+    // never has to write a dirty page outside a checkpoint boundary.
+    constexpr size_t kDirtyReserve = 6;
+    if (bpm_->dirty_frame_count() + kDirtyReserve >= config_.buffer_pool_frames) {
+        (void)checkpoint_locked();
+    }
 }
 
 void BPlusTreeEngine::simulate_crash_without_flush() {
