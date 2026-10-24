@@ -32,7 +32,7 @@ hybriddb-sys/
 │   ├── lsm.cpp                                         # 跳表、SSTable 稀疏 Fence Pointers、多路归并 Compaction
 │   └── cli_main.cpp                                    # 命令行与交互式 REPL 工具 (hybriddb_cli)
 ├── tests/
-│   └── test_main.cpp                                   # 7 大自动化正确性、边界、并发与故障注入测试套件
+│   └── test_main.cpp                                   # 12 大自动化正确性、边界、并发与故障注入测试套件
 ├── benchmarks/
 │   └── bench_experiments.cpp                           # 4 组控制变量论文验证实验（自动生成 CSV 数据）
 ├── results/                                            # 实测生成的标准 CSV 实验结果文件
