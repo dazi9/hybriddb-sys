@@ -4,6 +4,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
@@ -369,12 +370,17 @@ Status LSMTreeEngine::flush_memtable() {
     if (!st.ok()) return st;
 
     levels_[0].push_back(std::move(meta));
+    // Publish the new level state BEFORE destroying the recoverable copies:
+    // clearing the memtable and truncating the WAL is only safe once the
+    // SSTable that mirrors them is visible in an atomically saved manifest.
+    Status mst = save_manifest();
+    if (!mst.ok()) return mst;
+
     memtable_->clear();
     wal_->truncate_and_reset();
 
     Status cst = maybe_trigger_compaction();
     apply_bloom_tuning_internal();
-    save_manifest();
     return cst;
 }
 
@@ -445,24 +451,33 @@ Status LSMTreeEngine::compact_level(uint32_t level) {
         compacted_entries.push_back(std::move(entry));
     }
 
-    // Remove old SSTable files on disk
-    for (const auto& sst : levels_[level]) {
-        std::error_code ec;
-        std::filesystem::remove(sst.file_path, ec);
-    }
-    for (const auto& sst : levels_[next_level]) {
-        std::error_code ec;
-        std::filesystem::remove(sst.file_path, ec);
-    }
+    // Capture the superseded files before mutating the level state; they are
+    // deleted only after the new manifest has been atomically published.
+    std::vector<std::filesystem::path> superseded;
+    for (const auto& sst : levels_[level]) superseded.push_back(sst.file_path);
+    for (const auto& sst : levels_[next_level]) superseded.push_back(sst.file_path);
+
+    // Write the merged SSTable first, publish the new level state, and only
+    // then remove the old files. A crash before the manifest save leaves the
+    // old (still valid) state on disk plus an orphan file that startup GC
+    // removes; deleting first would instead leave the old manifest pointing
+    // at files that no longer exist.
     levels_[level].clear();
     levels_[next_level].clear();
-
     if (!compacted_entries.empty()) {
         SSTableMeta new_sst{};
         Status st = write_sstable_from_entries(
             next_level, compacted_entries, config_.bloom_bits_per_key, &new_sst);
         if (!st.ok()) return st;
         levels_[next_level].push_back(std::move(new_sst));
+    }
+
+    Status mst = save_manifest();
+    if (!mst.ok()) return mst;
+
+    for (const auto& path : superseded) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
     }
 
     stats_.compactions_run++;
@@ -477,6 +492,10 @@ Status LSMTreeEngine::compact_all() {
         Status st = write_sstable_from_entries(0, sorted_entries, config_.bloom_bits_per_key, &meta);
         if (!st.ok()) return st;
         levels_[0].push_back(std::move(meta));
+        // Publish the flush before destroying the recoverable copies (same
+        // invariant as flush_memtable).
+        Status mst = save_manifest();
+        if (!mst.ok()) return mst;
         memtable_->clear();
         wal_->truncate_and_reset();
     }
@@ -692,10 +711,15 @@ Status LSMTreeEngine::load_manifest() {
     uint32_t lvl = 0;
     uint64_t sid = 0;
     std::string fname;
+    std::set<std::filesystem::path> live_files;
     while (body_in >> lvl >> sid >> fname) {
         if (lvl >= levels_.size()) continue;
         std::filesystem::path spath = config_.db_dir / fname;
-        if (!std::filesystem::exists(spath)) continue;
+        // A manifest-listed SSTable that vanished from disk means the level
+        // state is incomplete: serving reads would surface stale values.
+        if (!std::filesystem::exists(spath)) {
+            return Status::Corruption("MANIFEST lists missing SSTable: " + fname);
+        }
 
         DiskManager dm(spath, nullptr);
         uint32_t npages = dm.num_pages();
@@ -709,7 +733,13 @@ Status LSMTreeEngine::load_manifest() {
 
         SlottedPage page;
         for (page_id_t pid = 0; pid < npages; ++pid) {
-            if (!dm.read_page(pid, &page, config_.verify_crc).ok()) break;
+            // A data page that fails its checksum poisons the fence-pointer
+            // and bloom rebuild below; continuing would silently hide keys
+            // and serve stale versions. Fail the open instead.
+            if (!dm.read_page(pid, &page, config_.verify_crc).ok()) {
+                return Status::Corruption(
+                    "SSTable " + fname + " has a corrupt page: " + std::to_string(pid));
+            }
             uint16_t n = page.header()->num_slots;
             if (n == 0) continue;
             std::string pmin(page.key_at(0));
@@ -723,8 +753,22 @@ Status LSMTreeEngine::load_manifest() {
             }
         }
         levels_[lvl].push_back(std::move(meta));
+        live_files.insert(spath);
     }
     apply_bloom_tuning_internal();
+
+    // Startup GC: compaction crashes can leave orphan SSTables that the
+    // (atomically published) manifest no longer references. Removing them
+    // also prevents sst_id reuse from colliding with leftover files.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(config_.db_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        if (entry.is_regular_file() && name.rfind("sst_L", 0) == 0 &&
+            name.size() > 4 && name.compare(name.size() - 4, 4, ".sst") == 0 &&
+            live_files.count(entry.path()) == 0) {
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
     return Status::Ok();
 }
 

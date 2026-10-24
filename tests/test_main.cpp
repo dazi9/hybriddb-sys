@@ -418,6 +418,55 @@ void test_lsm_manifest_corruption_fails_closed() {
     assert(threw);
 }
 
+void test_lsm_sst_corruption_fails_closed() {
+    // Regression: a bit flip inside an SST data page used to poison the
+    // fence-pointer/bloom rebuild (break-on-error), letting the bloom
+    // silently hide keys so older versions surfaced as fresh reads.
+    // Now the open must fail closed.
+    auto dir = make_temp_dir("lsm_sst_corrupt");
+    LSMConfig cfg{};
+    cfg.db_dir = dir;
+    cfg.memtable_max_bytes = 8 * 1024;
+    {
+        LSMTreeEngine lsm(cfg);
+        for (int i = 0; i < 100; ++i) {
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof(key_buf), "k:%05d", i);
+            assert(lsm.put(key_buf, "v" + std::to_string(i)).ok());
+        }
+        assert(lsm.compact_all().ok());
+    }
+
+    // Flip one bit in the middle of some SST data file.
+    bool flipped = false;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const auto name = entry.path().filename().string();
+        if (entry.is_regular_file() && name.rfind("sst_L", 0) == 0 &&
+            entry.file_size() > 1024) {
+            std::fstream f(entry.path(), std::ios::binary | std::ios::in | std::ios::out);
+            assert(f.is_open());
+            f.seekp(200);  // inside the first data page's record area
+            char byte;
+            f.read(&byte, 1);
+            f.seekp(200);
+            byte ^= 0x08;
+            f.write(&byte, 1);
+            flipped = true;
+            break;
+        }
+    }
+    assert(flipped);
+
+    bool threw = false;
+    try {
+        LSMTreeEngine lsm2(cfg);
+        (void)lsm2;
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
 void test_lsm_compaction_monkey_and_crash_recovery() {
     auto dir = make_temp_dir("lsm_engine");
     LSMConfig cfg{};
@@ -536,6 +585,7 @@ int main() {
     RUN_TEST(test_btree_crash_before_first_checkpoint);
     RUN_TEST(test_btree_dirty_pressure_small_pool);
     RUN_TEST(test_lsm_manifest_corruption_fails_closed);
+    RUN_TEST(test_lsm_sst_corruption_fails_closed);
     RUN_TEST(test_lsm_compaction_monkey_and_crash_recovery);
     RUN_TEST(test_concurrent_multithreaded_engines);
 
