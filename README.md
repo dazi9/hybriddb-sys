@@ -84,7 +84,9 @@ make bench
 
 | 实验编号 | 研究问题与理论来源 | 核心对比维度 | 实测关键结论 |
 | :--- | :--- | :--- | :--- |
-| **实验 1** (`exp1_btree_vs_lsm.csv`) | **O'Neil et al. (1996)**：B+ 树原地页更新 vs LSM-Tree 延迟批量归并的读写放大取舍 | 随机写吞吐、写放大 (WAF)、点查吞吐、范围扫描吞吐、读放大 (RAF) | **LSM-Tree 随机写吞吐达 `99,195 ops/s`（为 B+ 树的 `2.32x`）**，写放大 `WAF=4.12`（显著低于 B+ 树的 `11.26`）；而 **B+ 树点查快 `1.97x`、范围扫描快 `9.53x`**（`RAF=0.66` vs LSM 的 `5.72`）。 |
+| **实验 1** (`exp1_btree_vs_lsm.csv`) | **O'Neil et al. (1996)**：B+ 树原地页更新 vs LSM-Tree 延迟批量归并的读写放大取舍 | 随机写吞吐、写放大 (WAF)、点查吞吐、范围扫描吞吐、读放大 (RAF) | **LSM-Tree 随机写吞吐达 `112,577 ops/s`（为 B+ 树的 `2.71x`）**，写放大 `WAF=4.12`（显著低于 B+ 树的 `11.26`）；而 **B+ 树点查快 `1.70x`、范围扫描快 `8.39x`**（`RAF=0.66` vs LSM 的 `5.72`）。 |
+
+> **2026-10-25 性能优化增补**：基于 YCSB 风格基准的瓶颈定位（位级 CRC32 逐页校验 33.87µs、LSM 点查每 SST 每次 open()），实施两项针对性优化——`crc32_ieee` 改 slice-by-8 查表（位级等价）、SSTable 句柄 open-once 缓存。**B+ 树各负载吞吐 5.5~10.6x、LSM 点查最高 61.5x**（对照组 pybitcask/SQLite 漂移 <21%，归因成立），完整前后对比见 [docs/POST_OPTIMIZATION.md](docs/POST_OPTIMIZATION.md)。
 | **实验 2** (`exp2_buffer_pool_policies.csv`) | **O'Neil et al. (SIGMOD '93)**：顺序扫描污染（Scan Pollution）下的缓冲池替换策略 | `LRU-1` vs `Clock` vs `LRU-2` 在不同缓冲池帧数 $B \in \{16..64\}$ 下的命中率 | 在 $B=24$ 帧时，**`LRU-2` 命中率达 `61.25%`**，远超 `LRU-1` (`39.59%`) 与 `Clock` (`37.97%`)；`LRU-1` 需将内存扩大至 $B=48$ 帧 (`64.24%`) 才能追平 $B=24$ 的 `LRU-2`（等效内存比 $B(1)/B(2) \approx 2.0$）。 |
 | **实验 3** (`exp3_monkey_bloom_tuning.csv`) | **Dayan et al. (SIGMOD '17)**：LSM-Tree 跨层级 Bloom Filter 比特分配优化 | 相同总内存预算下 `Uniform`（均匀分配）vs `Monkey`（浅层高比特、深层低比特） | 在 $4.0 \sim 10.0\text{ bits/key}$ 全部预算下，**`Monkey` 将零结果点查的无效磁盘页读取降低了 `23.0% ~ 38.8%`**（如 4 bpk 下从 `2,506` 次降至 `1,534` 次，分配为 `L0=8.95, L1=6.06, L2=3.18`）。 |
 | **实验 4** (`exp4_wal_crash_recovery.csv`) | **Mohan et al. (1992)**：WAL 预写日志崩溃一致性与尾记录自愈 | 缓冲池未刷盘断电（200/1000 ops）与 WAL 末尾 13B 截断损坏注入 | 4 种故障场景下数据恢复准确率均为 **`100% (PASS)`**，1,000 条未刷盘事务在 **`1.25 ms`** 内完成重放恢复，损坏尾字节被精准截断。 |
