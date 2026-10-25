@@ -1,0 +1,10 @@
+build/
+*.o
+*.d
+*.pages
+*.wal
+*.sst
+MANIFEST
+hybriddb_data/
+my_btree/
+my_lsm/
