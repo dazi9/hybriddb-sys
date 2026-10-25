@@ -309,6 +309,39 @@ void test_wal_lsn_continuity_across_sessions() {
     }
 }
 
+void test_crc32_table_equivalence() {
+    // Regression: crc32_ieee was rewritten from a bitwise loop to slice-by-8
+    // tables; the value stream must be bit-identical or every on-disk CRC
+    // (pages, WAL, manifest) would be invalidated.
+    auto bitwise_reference = [](const uint8_t* data, size_t len, uint32_t prev) {
+        uint32_t crc = ~prev;
+        for (size_t i = 0; i < len; ++i) {
+            crc ^= data[i];
+            for (int bit = 0; bit < 8; ++bit) {
+                uint32_t mask = -(crc & 1U);
+                crc = (crc >> 1) ^ (0xEDB88320U & mask);
+            }
+        }
+        return ~crc;
+    };
+
+    // Standard CRC-32/ISO-HDLC check value.
+    assert(crc32_ieee("123456789", 9) == 0xCBF43926U);
+
+    std::mt19937 rng(42);
+    std::vector<uint8_t> buf(600);
+    for (auto& b : buf) b = static_cast<uint8_t>(rng() & 0xFFU);
+    for (size_t len = 0; len <= 500; ++len) {
+        assert(crc32_ieee(buf.data(), len) == bitwise_reference(buf.data(), len, 0));
+        if (len >= 8) {
+            // chained calls must equal a single call over the concatenation
+            uint32_t chained = crc32_ieee(buf.data(), 4);
+            chained = crc32_ieee(buf.data() + 4, len - 4, chained);
+            assert(chained == crc32_ieee(buf.data(), len));
+        }
+    }
+}
+
 void test_btree_crash_before_first_checkpoint() {
     // Regression: with no checkpoint ever run, the on-disk tree was just the
     // blank creation skeleton; recovery used to navigate garbage and lose
@@ -577,6 +610,7 @@ int main() {
     std::cout << "==========================================================" << std::endl;
 
     RUN_TEST(test_slotted_page_and_crc32);
+    RUN_TEST(test_crc32_table_equivalence);
     RUN_TEST(test_buffer_pool_lru2_scan_resistance);
     RUN_TEST(test_wal_recovery_and_fault_injection);
     RUN_TEST(test_bloom_filter_and_monkey_allocation);

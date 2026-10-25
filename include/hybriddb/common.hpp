@@ -87,16 +87,61 @@ struct StorageStats {
     }
 };
 
-// Fast IEEE 802.3 CRC32 implementation
+// IEEE 802.3 CRC32, slice-by-8 table-driven (same value stream as a bitwise
+// implementation with the reflected 0xEDB88320 polynomial — on-disk CRCs stay
+// compatible). ~8x fewer operations per byte than the bitwise loop.
+namespace detail {
+
+struct Crc32SlicingTables {
+    uint32_t t[8][256];
+
+    constexpr Crc32SlicingTables() : t{} {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1U) ? (0xEDB88320U ^ (c >> 1)) : (c >> 1);
+            }
+            t[0][i] = c;
+        }
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = t[0][i];
+            for (size_t j = 1; j < 8; ++j) {
+                c = (c >> 8) ^ t[0][c & 0xFFU];
+                t[j][i] = c;
+            }
+        }
+    }
+};
+
+inline constexpr Crc32SlicingTables kCrc32Slicing{};
+
+}  // namespace detail
+
 inline uint32_t crc32_ieee(const void* data, size_t length, uint32_t previous_crc = 0) noexcept {
     const auto* bytes = static_cast<const uint8_t*>(data);
     uint32_t crc = ~previous_crc;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= bytes[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            uint32_t mask = -(crc & 1U);
-            crc = (crc >> 1) ^ (0xEDB88320U & mask);
-        }
+
+    while (length >= 8) {
+        const uint32_t lo =
+            static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+            (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+        const uint32_t hi =
+            static_cast<uint32_t>(bytes[4]) | (static_cast<uint32_t>(bytes[5]) << 8) |
+            (static_cast<uint32_t>(bytes[6]) << 16) | (static_cast<uint32_t>(bytes[7]) << 24);
+        const uint32_t one = lo ^ crc;
+        crc = detail::kCrc32Slicing.t[7][one & 0xFFU] ^
+              detail::kCrc32Slicing.t[6][(one >> 8) & 0xFFU] ^
+              detail::kCrc32Slicing.t[5][(one >> 16) & 0xFFU] ^
+              detail::kCrc32Slicing.t[4][(one >> 24) & 0xFFU] ^
+              detail::kCrc32Slicing.t[3][hi & 0xFFU] ^
+              detail::kCrc32Slicing.t[2][(hi >> 8) & 0xFFU] ^
+              detail::kCrc32Slicing.t[1][(hi >> 16) & 0xFFU] ^
+              detail::kCrc32Slicing.t[0][(hi >> 24) & 0xFFU];
+        bytes += 8;
+        length -= 8;
+    }
+    while (length-- > 0) {
+        crc = detail::kCrc32Slicing.t[0][(crc ^ *bytes++) & 0xFFU] ^ (crc >> 8);
     }
     return ~crc;
 }

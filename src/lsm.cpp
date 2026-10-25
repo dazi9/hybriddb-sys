@@ -252,7 +252,7 @@ Status LSMTreeEngine::read_entries_from_sstable(
     std::vector<MemTableEntry>* out_entries) {
     out_entries->clear();
     out_entries->reserve(sst.num_entries);
-    DiskManager dm(sst.file_path, &stats_);
+    DiskManager& dm = sst_handle(sst);
     SlottedPage page;
     for (page_id_t pid = 0; pid < sst.num_data_pages; ++pid) {
         Status st = dm.read_page(pid, &page, config_.verify_crc);
@@ -268,6 +268,23 @@ Status LSMTreeEngine::read_entries_from_sstable(
         }
     }
     return Status::Ok();
+}
+
+DiskManager& LSMTreeEngine::sst_handle(const SSTableMeta& sst) {
+    {
+        std::lock_guard<std::mutex> lock(sst_handle_mutex_);
+        auto it = sst_handle_cache_.find(sst.sst_id);
+        if (it != sst_handle_cache_.end()) return *it->second;
+    }
+    auto opened = std::make_unique<DiskManager>(sst.file_path, &stats_);
+    std::lock_guard<std::mutex> lock(sst_handle_mutex_);
+    auto [it, inserted] = sst_handle_cache_.emplace(sst.sst_id, std::move(opened));
+    return *it->second;  // may be the raced loser's instance — either is valid
+}
+
+void LSMTreeEngine::close_sst_handle(uint64_t sst_id) {
+    std::lock_guard<std::mutex> lock(sst_handle_mutex_);
+    sst_handle_cache_.erase(sst_id);
 }
 
 Status LSMTreeEngine::search_in_sstable(
@@ -304,8 +321,10 @@ Status LSMTreeEngine::search_in_sstable(
         return Status::Ok();
     }
 
-    // 3. Perform exactly 1 physical 4KB page read via DiskManager
-    DiskManager dm(sst.file_path, &stats_);
+    // 3. Perform exactly 1 physical 4KB page read via the cached DiskManager
+    // (open-once per SSTable; a fresh open()/close() per query used to
+    // dominate point-lookup latency).
+    DiskManager& dm = sst_handle(sst);
     SlottedPage page;
     Status st = dm.read_page(it->page_id, &page, config_.verify_crc);
     if (!st.ok()) return st;
@@ -454,8 +473,15 @@ Status LSMTreeEngine::compact_level(uint32_t level) {
     // Capture the superseded files before mutating the level state; they are
     // deleted only after the new manifest has been atomically published.
     std::vector<std::filesystem::path> superseded;
-    for (const auto& sst : levels_[level]) superseded.push_back(sst.file_path);
-    for (const auto& sst : levels_[next_level]) superseded.push_back(sst.file_path);
+    std::vector<uint64_t> superseded_ids;
+    for (const auto& sst : levels_[level]) {
+        superseded.push_back(sst.file_path);
+        superseded_ids.push_back(sst.sst_id);
+    }
+    for (const auto& sst : levels_[next_level]) {
+        superseded.push_back(sst.file_path);
+        superseded_ids.push_back(sst.sst_id);
+    }
 
     // Write the merged SSTable first, publish the new level state, and only
     // then remove the old files. A crash before the manifest save leaves the
@@ -475,6 +501,9 @@ Status LSMTreeEngine::compact_level(uint32_t level) {
     Status mst = save_manifest();
     if (!mst.ok()) return mst;
 
+    for (const auto& id : superseded_ids) {
+        close_sst_handle(id);
+    }
     for (const auto& path : superseded) {
         std::error_code ec;
         std::filesystem::remove(path, ec);
@@ -595,7 +624,7 @@ Status LSMTreeEngine::scan(
             if (!end_key.empty() && it->min_key > end_key) continue;
 
             // Use Fence Pointers to read only 4KB data blocks overlapping [start_key, end_key]
-            DiskManager dm(it->file_path, &stats_);
+            DiskManager& dm = sst_handle(*it);
             SlottedPage page;
             for (const auto& fp : it->fence_pointers) {
                 if (!start_key.empty() && fp.max_key < start_key) continue;

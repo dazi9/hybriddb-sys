@@ -3,10 +3,12 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -167,6 +169,11 @@ private:
     Status save_manifest();
     Status load_manifest();
 
+    // Open-once handle cache: point lookups used to pay an open()/close() per
+    // candidate SSTable per query, which dominated their latency profile.
+    DiskManager& sst_handle(const SSTableMeta& sst);
+    void close_sst_handle(uint64_t sst_id);
+
     LSMConfig config_;
     StorageStats stats_{};
     std::unique_ptr<SkipListMemTable> memtable_;
@@ -175,6 +182,8 @@ private:
     uint64_t next_sst_id_{1};
     bool crashed_simulation_{false};
     mutable std::shared_mutex rw_latch_;
+    std::unordered_map<uint64_t, std::unique_ptr<DiskManager>> sst_handle_cache_;
+    std::mutex sst_handle_mutex_;
 };
 
 }  // namespace hybriddb
