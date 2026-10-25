@@ -1,6 +1,6 @@
 # HybridDB — 面向系统原理与论文实验的 B+ 树 / LSM-Tree 双引擎存储系统 (C++20)
 
-`HybridDB` 是专为计算机专业大二学生结合 **《深入理解计算机系统 (CS:APP)》** 与 **《计算思维实训》** 设计的系统软件研究与实现项目。
+`HybridDB` 是专为计算机专业大二学生结合 **《深入理解计算机系统 (CS:APP)》** 设计的系统软件研究与实现项目。
 
 不同于简单的课程实验（如 CS:APP Malloc/Cache/Shell Lab）或套壳 Web 应用，本项目直接从操作系统底层 I/O、内存层次结构与经典数据库系统论文出发，使用 **现代 C++20（零第三方依赖，`g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread`）** 从零实现了同一套 4KB 分页与 WAL 基础设施之上的 **B+ 树存储引擎** 与 **LSM-Tree 存储引擎**，并完成了对两篇 ACM SIGMOD 顶会论文核心算法的复现与控制变量实验验证：
 1. **O'Neil, O'Neil, Weikum (ACM SIGMOD 1993)**：*The LRU-K Page Replacement Algorithm For Database Disk Buffering* —— 复现带历史保留期（Retained Information Period）的 **`LRU-2` 缓冲池替换算法**，在周期性顺序扫描污染（Scan Pollution）下相比传统 `LRU-1` 与 `Clock` 将缓存命中率从 **39.59% 提升至 61.25%**。
