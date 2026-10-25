@@ -26,15 +26,15 @@
 
 #### (1) `google/leveldb`（源码核查：`db/dbformat.h`, `util/bloom.cc`, `util/cache.cc`）
 - **核查到的核心算法细节**：
-  - 在 `db/dbformat.h` 第 54~98 行中，LevelDB 将用户键 `user_key`、56 位单调递增序列号 `SequenceNumber` 和 8 位操作类型 `ValueType` (`kTypeDeletion = 0x0`, `kTypeValue = 0x1`) 拼接为 `InternalKey`，末尾 8 字节打包为 `(sequence << 8) | type`。比较时先按 `user_key` 升序，相同 `user_key` 按序列号**降序**排列，使最新版本永远排在最前面。
-  - 在 `util/bloom.cc` 第 19~54 行中，LevelDB 取 $k = \lfloor \text{bits\_per\_key} \times 0.69 \rfloor$，并使用 **Kirsch-Mitzenmacher 双哈希技巧**：仅计算一次 `uint32_t h = BloomHash(keys[i])`，令步长 `delta = (h >> 17) | (h << 15)`，循环 $k$ 次执行 `h += delta` 生成 $k$ 个探测位。
+  - 在 `db/dbformat.h` 第 54–98 行中，LevelDB 将用户键 `user_key`、56 位单调递增序列号 `SequenceNumber` 和 8 位操作类型 `ValueType` (`kTypeDeletion = 0x0`, `kTypeValue = 0x1`) 拼接为 `InternalKey`，末尾 8 字节打包为 `(sequence << 8) | type`。比较时先按 `user_key` 升序，相同 `user_key` 按序列号**降序**排列，使最新版本永远排在最前面。
+  - 在 `util/bloom.cc` 第 19–54 行中，LevelDB 取 k = ⌊bits_per_key × 0.69⌋，并使用 **Kirsch-Mitzenmacher 双哈希技巧**：仅计算一次 `uint32_t h = BloomHash(keys[i])`，令步长 `delta = (h >> 17) | (h << 15)`，循环 k 次执行 `h += delta` 生成 k 个探测位。
 - **已知限制（也是我们的研究切入点）**：
   - LevelDB 对所有层级的 SSTable 使用**固定相同的 `bits_per_key`**（通常为 10），没有根据不同层级的数据量指数增长特性动态分配比特数（SIGMOD '17 *Monkey* 论文指出的核心次优问题）。
   - LevelDB 仅实现 LSM-Tree，无法在同一套 4KB 页面管理器与缓冲池下直接与磁盘 B+ 树进行同构控制变量对比。
 
 #### (2) `cstack/db_tutorial`（源码核查：`db.c`）
 - **核查到的核心算法细节**：
-  - 在 `db.c` 第 59~150 行中，定义了 4096 字节页面与硬编码的 `Row` 结构（`id` 4B + `username` 33B + `email` 256B = 293B），实现了简单的叶子节点与内部节点分裂。
+  - 在 `db.c` 第 59–150 行中，定义了 4096 字节页面与硬编码的 `Row` 结构（`id` 4B + `username` 33B + `email` 256B = 293B），实现了简单的叶子节点与内部节点分裂。
 - **严重局限（为什么不能直接照搬）**：
   - 仅支持定长硬编码的 `(uint32_t id, username, email)` 表结构，不支持通用变长 Key-Value（无 Slotted-Page 分槽页结构）；
   - `Pager` 只是长度为 400 的裸指针数组 `void* pages[400]`，**没有任何页面替换策略（无 LRU/Clock/LRU-2，超过 400 页直接越界或无法淘汰）**；
@@ -43,7 +43,7 @@
 #### (3) `mit-pdos/xv6-riscv`（源码核查：`kernel/bio.c`, `kernel/log.c`）
 - **核查到的核心算法细节**：
   - `kernel/bio.c`（153 行）展示了最精炼的 `bget`/`bread`/`brelse` 缓冲池生命周期管理：当 `b->refcnt == 0` 时说明该帧未被任何线程 Pin 住，可作为淘汰候选（Victim）。
-  - `kernel/log.c`（234 行）展示了清晰的写前日志提交两阶段协议：`write_log()`（将脏块写入日志区） $\rightarrow$ `write_head()`（原子更新日志头中的块计数 `lh.n`，**这是真正的事务提交点 Commit Point**） $\rightarrow$ `install_trans()`（写回原位置） $\rightarrow$ 清零 `lh.n`。
+  - `kernel/log.c`（234 行）展示了清晰的写前日志提交两阶段协议：`write_log()`（将脏块写入日志区） → `write_head()`（原子更新日志头中的块计数 `lh.n`，**这是真正的事务提交点 Commit Point**） → `install_trans()`（写回原位置） → 清零 `lh.n`。
 
 ---
 
@@ -56,8 +56,8 @@
 #### 论文 1：LSM-Tree 开山之作
 1. **标题、作者、年份、期刊**：*The Log-Structured Merge-Tree (LSM-Tree)*, Patrick O'Neil, Edward Cheng, Dieter Gawlick, Elizabeth O'Neil, *Acta Informatica*, Vol. 33, No. 4, pp. 351–385, 1996.
 2. **DOI / 链接**：`https://doi.org/10.1007/s002360050048`（公开归档全文：`https://cs.umb.edu/~poneil/lsmtree.pdf`）
-3. **研究问题与核心思想**：高频插入场景下，传统 B+ 树每次随机插入都需要将磁盘页读入内存、修改后再写回磁盘，引发高昂的随机磁盘寻道开销。LSM-Tree 通过将更新先缓存在内存组件 $C_0$ 中，满后以类似归并排序（Merge Sort）的方式批量滚动归并（Rolling Merge）到磁盘组件 $C_1, C_2, \dots, C_k$，将随机写转化为顺序批量写。
-4. **核心架构**：内存树 $C_0$ + 多层容量呈指数增长的磁盘有序组件 $C_1 \dots C_k$。
+3. **研究问题与核心思想**：高频插入场景下，传统 B+ 树每次随机插入都需要将磁盘页读入内存、修改后再写回磁盘，引发高昂的随机磁盘寻道开销。LSM-Tree 通过将更新先缓存在内存组件 C₀ 中，满后以类似归并排序（Merge Sort）的方式批量滚动归并（Rolling Merge）到磁盘组件 C₁, C₂, …, Cₖ，将随机写转化为顺序批量写。
+4. **核心架构**：内存树 C₀ + 多层容量呈指数增长的磁盘有序组件 C₁ … Cₖ。
 5. **实验与指标**：采用 TPC-A History 表与索引插入负载，比较每字节写入的磁盘臂移动成本（Disk Arm Cost）与存储介质成本。
 6. **适合本科生复现的部分**：内存有序结构（SkipList）+ 多层磁盘 SSTable 归并 + 与 B+ 树的写放大（WAF）和读放大（RAF）实测对比。
 7. **可验证的研究问题**：在相同的 4KB 磁盘块粒度下，LSM-Tree 相比 B+ 树能降低多少写放大？代价是点查和范围扫描的读放大增加了多少？
@@ -70,15 +70,15 @@
 2. **DOI / 链接**：`https://doi.org/10.1145/3035918.3064054`（作者公开 PDF：`http://nivdayan.github.io/monkeykeyvaluestore.pdf`，已下载至 `/tmp/opencode/papers/monkey_sigmod17.pdf` 并完整提取 101,904 字符正文）
 3. **实际阅读范围声明**：完整阅读了论文 **Abstract、Section 1 (Introduction)、Section 2 (Background)、Section 3 (The LSM-Tree Design Space)、Section 4 (Optimal Bloom Filter Allocation，含公式推导与表 1 渐近复杂度对比)、Section 5 (Experimental Evaluation)**。
 4. **研究问题与核心思想**：
-   所有主流 LSM-Tree 系统（LevelDB、RocksDB、Cassandra）都给每一层的 Bloom Filter 分配**相同的每键比特数（Fixed bits-per-entry）**，导致每一层的假阳性率 $p_i$ 相同。然而，LSM-Tree 各层容量按比例 $T$ 指数增长，最深层 $L$ 拥有全库约 $\frac{T-1}{T}$ 的数据量，消耗了绝大部分 Bloom Filter 内存，但它对总假阳性率之和 $\sum_{i=1}^L p_i$ 的贡献却只占 $1/L$！
-   Monkey 证明：最坏情况零结果点查 I/O 成本正比于 $\sum_{i=1}^L p_i$。通过拉格朗日乘子法最小化 $\sum p_i$（受限于总内存预算 $\sum N_i m_i \le M_{\text{filters}}$），最优分配应当让各层假阳性率**正比于该层的数据量**（$p_{i} = p_{i+1} / T$），即**给浅层（$L_0, L_1$）分配更多的 bits-per-key，给最深层分配较少的 bits-per-key**！
+   所有主流 LSM-Tree 系统（LevelDB、RocksDB、Cassandra）都给每一层的 Bloom Filter 分配**相同的每键比特数（Fixed bits-per-entry）**，导致每一层的假阳性率 pᵢ 相同。然而，LSM-Tree 各层容量按比例 T 指数增长，最深层 L 拥有全库约 \frac{T-1{T 的数据量，消耗了绝大部分 Bloom Filter 内存，但它对总假阳性率之和 \sum_{i=1^L pᵢ 的贡献却只占 1/L！
+   Monkey 证明：最坏情况零结果点查 I/O 成本正比于 \sum_{i=1^L pᵢ。通过拉格朗日乘子法最小化 \sum pᵢ（受限于总内存预算 \sum Nᵢ mᵢ \le M_{filters），最优分配应当让各层假阳性率**正比于该层的数据量**（p_{i = p_{i+1 / T），即**给浅层（L₀, L₁）分配更多的 bits-per-key，给最深层分配较少的 bits-per-key**！
 5. **核心公式与复杂度改进**：
-   - 传统固定分配（State-of-the-art）Leveling 点查成本：$O\left(\log_T\left(\frac{N \cdot E}{M_{\text{buffer}}}\right) \cdot e^{-M_{\text{filters}}/N}\right)$
-   - Monkey 最优分配 Leveling 点查成本：**$O\left(e^{-M_{\text{filters}}/N}\right)$**（直接消去了层数因子 $\log_T(\dots)$！）
+   - 传统固定分配（State-of-the-art）Leveling 点查成本：O\left(log_T\left(\frac{N \cdot E{M_{buffer\right) \cdot e^{-M_{filters/N\right)
+   - Monkey 最优分配 Leveling 点查成本：**O\left(e^{-M_{filters/N\right)**（直接消去了层数因子 log_T(…)！）
    - 相邻层每键比特数差值公式：
-     $$b_i - b_{i+1} = \frac{\ln(N_{i+1}/N_i)}{(\ln 2)^2}$$
+     bᵢ - b_{i+1 = \frac{\ln(N_{i+1/Nᵢ){(\ln 2)^2
 6. **作者报告的实验结果**：在 LevelDB 上实现 Monkey 后，随着数据量增长，零结果点查延迟降低了 **50% ~ 80%**；在读写混合调优下点查成本降低高达 **60%** 或更新成本降低 **70%**。
-7. **本项目构造的可验证研究问题**：在 `HybridDB` 的 3 层 LSM-Tree（$L_0:L_1:L_2 = 1:4:16$）中实现 Monkey 分配器，在完全相同的总字节预算（$4, 5, 6, 8, 10\text{ bits/key}$）下，测试 5,000 次零结果点查，对比 `Uniform` 与 `Monkey` 产生的真实无效磁盘页读取次数（见实验 3）。
+7. **本项目构造的可验证研究问题**：在 `HybridDB` 的 3 层 LSM-Tree（L₀:L₁:L₂ = 1:4:16）中实现 Monkey 分配器，在完全相同的总字节预算（4, 5, 6, 8, 10 bits/key）下，测试 5,000 次零结果点查，对比 `Uniform` 与 `Monkey` 产生的真实无效磁盘页读取次数（见实验 3）。
 
 ---
 
@@ -88,27 +88,27 @@
 3. **实际阅读范围声明**：完整阅读了论文 **Abstract、Section 1 (Introduction & Problem Statement)、Section 2 (Definition 2.2 LRU-K Algorithm & Retained Information Period)、Section 4 (Simulation Experiments & Table 4.3 OLTP Trace Results)**。
 4. **研究问题与核心思想**：
    传统操作系统与数据库广泛使用的 `LRU-1` 算法仅根据**最后一次访问时间**决定淘汰哪一页。当系统中出现一次性的顺序全表扫描（Sequential Scan）或低频随机冷页访问时，刚被读入一次的冷页会拥有最新的时间戳，从而把长期高频访问的热点索引页/数据页挤出缓冲池（即**扫描污染 Scan Pollution**）。
-   `LRU-K`（论文推荐 $K=2$，即 `LRU-2`）记录每个页面**最近 $K$ 次访问的时间戳**，定义页面 $p$ 的 **Backward K-distance $b_t(p, K)$** 为当前时间减去倒数第 $K$ 次访问的时间：
-   - 若某页面仅被访问了 1 次（如顺序扫描页），其 $b_t(p, 2) = \infty$，在淘汰时会被**最优先淘汰**，绝不会挤走已访问过 $\ge 2$ 次的热点页！
+   `LRU-K`（论文推荐 K=2，即 `LRU-2`）记录每个页面**最近 K 次访问的时间戳**，定义页面 p 的 **Backward K-distance bₜ(p, K)** 为当前时间减去倒数第 K 次访问的时间：
+   - 若某页面仅被访问了 1 次（如顺序扫描页），其 bₜ(p, 2) = ∈fty，在淘汰时会被**最优先淘汰**，绝不会挤走已访问过 \ge 2 次的热点页！
    - 同时论文第 2.1 节指出：必须为已淘汰页面在内存中保留一段时间的访问历史（Retained Information Period），否则冷热交替页每次被淘汰后历史清零就无法累积到第 2 次访问。
 5. **作者报告的实验结果（核查自原论文 Table 4.3）**：
    在 20GB 商业 OLTP 负载（40% 访问集中在 3% 热点页）下：
-   - 当缓冲池大小 $B=100$ 页时：`LRU-1` 命中率仅 `0.005 (0.5%)`，而 `LRU-2` 达到 `0.07 (7.0%)`，等效缓冲池容量比 $B(1)/B(2) = 4.5$；
-   - 当 $B=300$ 页时：`LRU-1` 命中率 `0.02`，`LRU-2` 命中率 `0.20`（提升 10 倍，$B(1)/B(2) = 3.0$）；
-   - 当 $B=600$ 页时：`LRU-1` 命中率 `0.13`，`LRU-2` 命中率 `0.25`（$B(1)/B(2) = 2.16$）；
-   - 当 $B=5000$ 页（缓冲池极大）时：两者收敛（`0.46` vs `0.47`）。
-6. **本项目构造的可验证研究问题**：在 `HybridDB` 的 `BufferPoolManager` 中同时实现 `LRU-1`、`Clock` 和带历史保留表的 `LRU-2`，在“85% 热点访问 + 周期性顺序扫描突发”负载下测试 $B \in \{16, 24, 32, 48, 64\}$ 帧时的真实命中率曲线（见实验 2）。
+   - 当缓冲池大小 B=100 页时：`LRU-1` 命中率仅 `0.005 (0.5%)`，而 `LRU-2` 达到 `0.07 (7.0%)`，等效缓冲池容量比 B(1)/B(2) = 4.5；
+   - 当 B=300 页时：`LRU-1` 命中率 `0.02`，`LRU-2` 命中率 `0.20`（提升 10 倍，B(1)/B(2) = 3.0）；
+   - 当 B=600 页时：`LRU-1` 命中率 `0.13`，`LRU-2` 命中率 `0.25`（B(1)/B(2) = 2.16）；
+   - 当 B=5000 页（缓冲池极大）时：两者收敛（`0.46` vs `0.47`）。
+6. **本项目构造的可验证研究问题**：在 `HybridDB` 的 `BufferPoolManager` 中同时实现 `LRU-1`、`Clock` 和带历史保留表的 `LRU-2`，在“85% 热点访问 + 周期性顺序扫描突发”负载下测试 B ∈ {16, 24, 32, 48, 64 帧时的真实命中率曲线（见实验 2）。
 
 ---
 
 #### 论文 4：WiscKey — 面向 SSD 的键值分离 LSM-Tree
 1. **标题、作者、年份、会议**：*WiscKey: Separating Keys from Values in SSD-Conscious Storage*, Lanyue Lu, Thanumalayan Sankaranarayana Pillai, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau (UW-Madison), *14th USENIX Conference on File and Storage Technologies (FAST '16)*, pp. 133–148, 2016.
 2. **链接**：`https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu`
-3. **核心思想与结果**：指出 LSM-Tree 在后台 Compaction 时反复归并大尺寸 Value 是造成写放大（WAF 达 $10\times \sim 50\times$）的根源。WiscKey 只在 LSM-Tree 中存储 Key 和指向追加写 `vLog` 的地址指针，将加载速度提升 $2.5\times \sim 111\times$，随机查找提升 $1.6\times \sim 14\times$，代价是范围扫描需要随机读取 `vLog` 且需要额外的 `vLog` 垃圾回收。
+3. **核心思想与结果**：指出 LSM-Tree 在后台 Compaction 时反复归并大尺寸 Value 是造成写放大（WAF 达 10× – 50×）的根源。WiscKey 只在 LSM-Tree 中存储 Key 和指向追加写 `vLog` 的地址指针，将加载速度提升 2.5× – 111×，随机查找提升 1.6× – 14×，代价是范围扫描需要随机读取 `vLog` 且需要额外的 `vLog` 垃圾回收。
 
 #### 论文 5：Kirsch & Mitzenmacher — 双哈希布隆过滤器
 1. **标题、作者、年份、期刊**：*Less Hashing, Same Performance: Building a Better Bloom Filter*, Adam Kirsch, Michael Mitzenmacher (Harvard University), *Random Structures & Algorithms*, Vol. 33, No. 2, pp. 187–218, 2008. DOI: `10.1002/rsa.20208`.
-2. **核心思想**：证明仅需两个独立的哈希函数 $h_1(x), h_2(x)$，通过线性组合 $g_i(x) = (h_1(x) + i \cdot h_2(x)) \bmod m \ (i=0 \dots k-1)$ 即可构造 $k$ 个探测位，且渐近假阳性率仍严格保持为 $\left(1 - e^{-kn/m}\right)^k$，大幅降低了布隆过滤器的 CPU 哈希计算开销（已在 `HybridDB` 的 `src/bloom.cpp` 中完整实现）。
+2. **核心思想**：证明仅需两个独立的哈希函数 h₁(x), h₂(x)，通过线性组合 gᵢ(x) = (h₁(x) + i \cdot h₂(x)) \bmod m \ (i=0 … k-1) 即可构造 k 个探测位，且渐近假阳性率仍严格保持为 \left(1 - e^{-kn/m\right)^k，大幅降低了布隆过滤器的 CPU 哈希计算开销（已在 `HybridDB` 的 `src/bloom.cpp` 中完整实现）。
 
 #### 论文 6：ARIES — 预写日志（WAL）与崩溃恢复协议
 1. **标题、作者、年份、期刊**：*ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging*, C. Mohan et al. (IBM Almaden), *ACM Transactions on Database Systems (TODS)*, Vol. 17, No. 1, pp. 94–162, 1992. DOI: `10.1145/128765.128770`.
